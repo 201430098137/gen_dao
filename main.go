@@ -1,26 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"github.com/pkg/errors"
-	"go/format"
 	"os"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"unicode"
 )
 
 func main() {
-	//生成dao
-	//a, err := gen(map[string]string{})
-	//if err != nil {
-	//	panic(err)
-	//}
-	//println(string(a))
+	//生成mongo orm
+	//genMongo()
 
-	//生成orm
-	gen2()
+	//生成orm和dao
+	gen()
 }
 
 // tpl 生成代码需要用到模板
@@ -31,9 +30,9 @@ const tpl = `
 package {{.pkg}}
 
 import (
-	"code.speakin.mobi/fusion_cloud/meeting_system/orm"
-	"errors"
-	"github.com/jinzhu/gorm"
+	"code.speakin.mobi/spider/media_spider/mysql/orm"
+	"github.com/pkg/errors"
+	"gorm.io/gorm"
 )
 
 type _{{.tableName}}Dao struct {
@@ -41,104 +40,451 @@ type _{{.tableName}}Dao struct {
 }
 
 func new{{.tableName}}Dao(db *gorm.DB) (*_{{.tableName}}Dao, error) {
-	a := &orm.{{.tableName}}{}
-	err := db.Set("gorm:table_options", "comment '权限表'").AutoMigrate(a).Error
+	s := &orm.{{.tableName}}{}
+	err := db.Set("gorm:table_options", "comment '{{.tableComment}}'").AutoMigrate(s)
 	if err != nil {
-		return nil, errors.New(err.Error())
+		return nil, errors.Wrap(err, "设置任务表表名失败")
 	}
 
-	return &_{{.tableName}}Dao{db.Model(a)}, nil
-}
-
-type {{.tableName}}QueryCondition struct {
-	{{.tableName}}Ids []int64
-}
-
-func (authorityDao *_{{.tableName}}Dao) GetListByCond(cond {{.tableName}}QueryCondition) ([]*orm.{{.tableName}}, error) {
-	query := authorityDao.db
-	if len(cond.{{.tableName}}Ids) != 0 {
-		query = query.Where("authorityId IN (?)", cond.{{.tableName}}Ids)
-	}
-
-	list := make([]*orm.{{.tableName}}, 0)
-	err := query.Find(&list).Error
-	if err != nil {
-		return nil, err
-	}
-	return list, nil
+	return &_{{.tableName}}Dao{db.Table(s.TableName()).Session(&gorm.Session{SkipDefaultTransaction: true})}, nil
 }
 `
 
-// gen 生成代码
-func gen(comments map[string]string) ([]byte, error) {
-	var buf = bytes.NewBufferString("")
+const mongoTpl = `
+package {{.pkg}}
 
-	data := map[string]interface{}{
-		"pkg":       "mysql_dao",
-		"tableName": "MeetingMemberRelate",
-	}
+import (
+	"{{.pkgPath}}/base"
+	"{{.pkgPath}}/mongo/orm"
+	"context"
+	"go.mongodb.org/mongo-driver/bson"
 
-	t, err := template.New("").Parse(tpl)
-	if err != nil {
-		return nil, errors.Wrap(err, "template init err")
-	}
+	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/mongo"
+)
 
-	err = t.Execute(buf, data)
-	if err != nil {
-		return nil, errors.Wrap(err, "template data err")
-	}
-
-	return format.Source(buf.Bytes())
+type _{{.tableName}}Dao struct {
+	db *mongo.Collection
 }
 
-func gen2() {
+func new{{.tableName}}Dao(ctx context.Context, db *mongo.Database) (*_{{.tableName}}Dao, error) {
+	coll := db.Collection("{{.tableRealName}}")
+`
 
-	str := "### 转写记录关联表 translation_record_relate\n字段名|类型|说明\n--|--|--\nid|int64|唯一标识\ntitle|string|主题名\nrelateType|string|关联类型:online线上 offline线下\nrelateId|int64|关联id\nstartTime|int64|开始时间\nabstract|text(500)|摘要\nbelongUserId|int64|所属用户id\ncreateTime|int64|创建时间\nupdateTime|int64|创建时间"
+const mongoTplSuffix = `	return &_{{.tableName}}Dao{
+		db: coll,
+	}, nil
+}
 
-	strs := strings.Split(str, "\n")
-	table := strs[0]
-	table = strings.TrimPrefix(table, "###")
-	table = strings.TrimSpace(table)
-	tables := strings.Split(table, " ")
-	//tableComment := tables[0]
-	tableName := tables[1]
 
-	f, err := os.Create(tableName + ".go")
+func (db _{{.tableName}}Dao) Insert(ctx context.Context, info *orm.{{.tableName}}) error {
+	info.CreateTime = base.GetCurrentTime()
+	info.UpdateTime = base.GetCurrentTime()
+	_, err := db.db.InsertOne(ctx, info)
+	return err
+}`
+
+//_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+//	Keys: bson.D{
+//		bson.E{Key: "subTaskId", Value: 1},
+//	},
+//})
+//if err != nil {
+//	return nil, errors.New("createIndex error1:" + err.Error())
+//}
+//	return &_UserOriginDataDao{
+//		db: coll,
+//	}, nil
+//}
+//`
+
+const (
+	NORMAL   = "normal"
+	COMPLEX  = "complex"
+	PRIMARY  = "primary_key"
+	FULLTEXT = "fulltext"
+)
+
+type Index struct {
+	priority  int
+	fieldName string
+}
+
+// gen 生成代码
+func genMongo() {
+	file, err := os.Open("aa.md")
 	if err != nil {
 		panic(err)
 	}
+	var ormFile, daoFile *os.File
+	var indexM = map[string][]Index{}
+	var tableName string
+	reader := bufio.NewReader(file)
+	for line, _, err := reader.ReadLine(); err == nil; line, _, err = reader.ReadLine() {
+		s := strings.TrimSpace(string(line))
+		if s == "" {
+			continue
+		}
+		switch {
+		case strings.Contains(s, "###"):
+			if ormFile != nil {
+				fmt.Fprintln(ormFile, "}")
 
-	fmt.Fprintln(f, "package orm")
-	fmt.Fprintln(f, "type "+strings.Title(tableName)+" struct {")
-	for _, field := range strs[3:] {
-		fields := strings.Split(field, "|")
-		fieldName := fields[0]
-		fieldType := fields[1]
-		fieldComment := fields[2]
+				fmt.Fprintf(ormFile, "func ("+strings.Title(tableName)+") TableName() string {")
+				fmt.Fprintln(ormFile, "return \""+Camel2Case(tableName)+"\"")
+				fmt.Fprintln(ormFile, "}")
 
-		defaultVal := "0"
-		switch fieldName {
-		case "string":
-			defaultVal = "''"
+				fmt.Fprintf(ormFile, "func (info *"+strings.Title(tableName)+") String() string {")
+				fmt.Fprintln(ormFile, "return toString(info)")
+				fmt.Fprintln(ormFile, "}")
+				ormFile.Close()
+			}
+
+			if daoFile != nil {
+				for _, list := range indexM {
+					index := "_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{\n\t\tKeys: bson.D{\n\t\t\t"
+					sort.Slice(list, func(i, j int) bool {
+						if list[i].priority < list[j].priority {
+							return true
+						}
+						return false
+					})
+
+					for _, idx := range list {
+						index = fmt.Sprintf("%sbson.E{Key: \"%s\", Value: 1},\n\t\t", index, idx.fieldName)
+					}
+					index = fmt.Sprintf("%s},\n\t})\n\tif err != nil {\n\t\treturn nil, "+
+						"errors.New(\"createIndex error1:\" + err.Error())\n\t}", index)
+					fmt.Fprintln(daoFile, index)
+				}
+				indexM = map[string][]Index{}
+
+				m := map[string]interface{}{
+					"tableName": tableName,
+				}
+				t, err := template.New("").Parse(mongoTplSuffix)
+				if err != nil {
+					panic(errors.Wrap(err, "template init err"))
+				}
+
+				var buf = bytes.NewBufferString("")
+				err = t.Execute(buf, m)
+				if err != nil {
+					panic(errors.Wrap(err, "template data err"))
+				}
+				fmt.Fprintln(daoFile, buf.String())
+
+				daoFile.Close()
+			}
+
+			table := strings.TrimPrefix(s, "###")
+			table = strings.TrimSpace(table)
+			tables := strings.Split(table, " ")
+			tableName = tables[1]
+			ormFile, err = os.Create("orm/" + tableName + ".go")
+			if err != nil {
+				panic(err)
+			}
+			tableName = ToCamelCase(tableName)
+			fmt.Fprintln(ormFile, "package orm")
+			fmt.Fprintln(ormFile, "type "+tableName+" struct {")
+
+			//生成dao
+			daoFile, err = os.Create("dao/" + Camel2Case(tableName) + ".go")
+			if err != nil {
+				panic(err)
+			}
+			tableName = ToCamelCase(tableName)
+			m := map[string]interface{}{
+				"pkg":           "dao",
+				"tableName":     tableName,
+				"tableRealName": Camel2Case(tableName),
+				"pkgPath":       "code.speakin.mobi/spider/media_spider",
+			}
+			t, err := template.New("").Parse(mongoTpl)
+			if err != nil {
+				panic(errors.Wrap(err, "template init err"))
+			}
+
+			var buf = bytes.NewBufferString("")
+			err = t.Execute(buf, m)
+			if err != nil {
+				panic(errors.Wrap(err, "template data err"))
+			}
+			fmt.Fprintln(daoFile, buf.String())
+
+		case strings.Contains(s, "|") && !strings.Contains(s, "----") && !strings.Contains(s, "字段名"):
+			fields := strings.Split(s, "|")
+			fieldName := strings.TrimSpace(fields[1])
+			fieldType := strings.TrimSpace(fields[2])
+			fieldComment := strings.TrimSpace(fields[3])
+			indexType := strings.TrimSpace(fields[4])
+			switch {
+			//_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+			//		Keys: bson.D{
+			//			bson.E{Key: "subTaskId", Value: 1},
+			//		},
+			//	})
+			//	if err != nil {
+			//		return nil, errors.New("createIndex error1:" + err.Error())
+			//	}
+			case strings.Contains(indexType, NORMAL):
+				index := fmt.Sprintf("_, err := coll.Indexes().CreateOne(ctx, "+
+					"mongo.IndexModel{\n\t\tKeys: bson.D{\n\t\t\tbson.E{Key: \"%s\", Value: 1},\n\t\t},"+
+					"\n\t})\n\tif err != nil {\n\t\treturn nil, errors.New(\"createIndex error1:\" + err.Error())\n\t}", fieldName)
+				fmt.Fprintln(daoFile, index)
+			case strings.Contains(indexType, COMPLEX):
+				strs := strings.Split(indexType, ":")
+				indexName := strs[1]
+				priority, _ := strconv.Atoi(strs[2])
+
+				list, ok := indexM[indexName]
+				if !ok {
+					list = make([]Index, 0, 2)
+				}
+				list = append(list, Index{
+					priority:  priority,
+					fieldName: fieldName,
+				})
+				indexM[indexName] = list
+			}
+
+			goType := fieldType
+			switch {
+			case strings.Contains(fieldType, "char") || strings.Contains(fieldType, "text"):
+				//defaultVal = "default:'';"
+				//re := regexp.MustCompile(`[\d]+`)
+				//size := re.FindStringSubmatch(fieldType)[0]
+				re := regexp.MustCompile(`[\w]+`)
+				columeType := re.FindStringSubmatch(fieldType)[0]
+				fmt.Println(columeType)
+				goType = "string"
+				fmt.Fprintln(ormFile,
+					fmt.Sprintf("%s %s `json:\"%s\" bson:\"%s\" desc:\"%s\"`",
+						strings.Title(fieldName), goType, fieldName, fieldName,
+						fieldComment))
+			default:
+				fmt.Fprintln(ormFile,
+					fmt.Sprintf("%s %s `json:\"%s\" bson:\"%s\" desc:\"%s\"`",
+						strings.Title(fieldName), goType, fieldName, fieldName,
+						fieldComment))
+			}
+		default:
+
 		}
 
-		fmt.Fprintln(f, strings.Title(fieldName)+" "+fieldType+" `gorm:\"column:"+fieldName+";NOT NULL;default"+
-			":"+defaultVal+
-			";comment"+
-			":'"+fieldComment+"'\"`")
 	}
-	fmt.Fprintln(f, "}")
 
-	fmt.Fprintf(f, "func ("+strings.Title(tableName)+") TableName() string {")
-	fmt.Fprintln(f, "return \""+Camel2Case(tableName)+"\"")
-	fmt.Fprintln(f, "}")
+	if ormFile != nil {
+		fmt.Fprintln(ormFile, "}")
 
-	//func (info *Member) String() string {
-	//	return toString(info)
-	//}
-	fmt.Fprintf(f, "func (info *"+strings.Title(tableName)+") String() string {")
-	fmt.Fprintln(f, "return toString(info)")
-	fmt.Fprintln(f, "}")
+		fmt.Fprintf(ormFile, "func ("+strings.Title(tableName)+") TableName() string {")
+		fmt.Fprintln(ormFile, "return \""+Camel2Case(tableName)+"\"")
+		fmt.Fprintln(ormFile, "}")
+
+		//func (info *Member) String() string {
+		//	return toString(info)
+		//}
+		fmt.Fprintf(ormFile, "func (info *"+strings.Title(tableName)+") String() string {")
+		fmt.Fprintln(ormFile, "return toString(info)")
+		fmt.Fprintln(ormFile, "}")
+		ormFile.Close()
+	}
+
+	if daoFile != nil {
+		for _, list := range indexM {
+			index := "_, err := coll.Indexes().CreateOne(ctx, mongo.IndexModel{\n\t\tKeys: bson.D{\n\t\t\t"
+			sort.Slice(list, func(i, j int) bool {
+				if list[i].priority < list[j].priority {
+					return true
+				}
+				return false
+			})
+
+			for _, idx := range list {
+				index = fmt.Sprintf("%sbson.E{Key: \"%s\", Value: 1},\n\t\t", index, idx.fieldName)
+			}
+			index = fmt.Sprintf("%s},\n\t})\n\tif err != nil {\n\t\treturn nil, "+
+				"errors.New(\"createIndex error1:\" + err.Error())\n\t}", index)
+			fmt.Fprintln(daoFile, index)
+		}
+		indexM = map[string][]Index{}
+
+		m := map[string]interface{}{
+			"tableName": tableName,
+		}
+		t, err := template.New("").Parse(mongoTplSuffix)
+		if err != nil {
+			panic(errors.Wrap(err, "template init err"))
+		}
+
+		var buf = bytes.NewBufferString("")
+		err = t.Execute(buf, m)
+		if err != nil {
+			panic(errors.Wrap(err, "template data err"))
+		}
+		fmt.Fprintln(daoFile, buf.String())
+		daoFile.Close()
+	}
+
+}
+
+func gen() {
+	file, err := os.Open("aa.md")
+	if err != nil {
+		panic(err)
+	}
+	var ormFile, daoFile *os.File
+	var tableName string
+	reader := bufio.NewReader(file)
+	for line, _, err := reader.ReadLine(); err == nil; line, _, err = reader.ReadLine() {
+		s := strings.TrimSpace(string(line))
+		if s == "" {
+			continue
+		}
+		switch {
+		case strings.Contains(s, "###"):
+			if ormFile != nil {
+				fmt.Fprintln(ormFile, "}")
+
+				fmt.Fprintf(ormFile, "func ("+strings.Title(tableName)+") TableName() string {")
+				fmt.Fprintln(ormFile, "return \""+Camel2Case(tableName)+"\"")
+				fmt.Fprintln(ormFile, "}")
+
+				//func (info *Member) String() string {
+				//	return toString(info)
+				//}
+				fmt.Fprintf(ormFile, "func (info *"+strings.Title(tableName)+") String() string {")
+				fmt.Fprintln(ormFile, "return toString(info)")
+				fmt.Fprintln(ormFile, "}")
+				ormFile.Close()
+			}
+
+			table := strings.TrimPrefix(s, "###")
+			table = strings.TrimSpace(table)
+			tables := strings.Split(table, " ")
+			tableName = tables[1]
+			tableComment := tables[0]
+			ormFile, err = os.Create("orm/" + tableName + ".go")
+			if err != nil {
+				panic(err)
+			}
+			fmt.Fprintln(ormFile, "package orm")
+			fmt.Fprintln(ormFile, "type "+ToCamelCase(tableName)+" struct {")
+			daoFile, err = os.Create("dao/" + tableName + ".go")
+			if err != nil {
+				panic(err)
+			}
+			tableName = ToCamelCase(tableName)
+			m := map[string]interface{}{
+				"pkg":          "dao",
+				"tableName":    tableName,
+				"tableComment": tableComment,
+			}
+			t, err := template.New("").Parse(tpl)
+			if err != nil {
+				panic(errors.Wrap(err, "template init err"))
+			}
+
+			var buf = bytes.NewBufferString("")
+			err = t.Execute(buf, m)
+			if err != nil {
+				panic(errors.Wrap(err, "template data err"))
+			}
+			fmt.Fprintf(daoFile, buf.String())
+			daoFile.Close()
+
+		case strings.Contains(s, "|") && !strings.Contains(s, "----") && !strings.Contains(s, "字段名"):
+			fields := strings.Split(s, "|")
+			fieldName := strings.TrimSpace(fields[1])
+			fieldType := strings.TrimSpace(fields[2])
+			fieldComment := strings.TrimSpace(fields[3])
+			indexType := strings.TrimSpace(fields[4])
+			index := ""
+			defaultVal := "default:0;"
+			switch {
+			case strings.Contains(indexType, NORMAL):
+				index = fmt.Sprintf("index:idx_%s", fieldName)
+			case strings.Contains(indexType, COMPLEX):
+				strs := strings.Split(indexType, ":")
+				indexName := strs[1]
+				priority := strs[2]
+				index = fmt.Sprintf("index:%s,priority:%s", indexName, priority)
+			case strings.Contains(indexType, PRIMARY):
+				index = "primary_key;AUTO_INCREMENT;"
+				defaultVal = ""
+			case strings.Contains(indexType, FULLTEXT):
+				index = "index:,class:FULLTEXT,option:WITH PARSER ngram"
+			}
+
+			goType := fieldType
+			switch {
+			case strings.Contains(fieldType, "char") || strings.Contains(fieldType, "text"):
+				defaultVal = "default:'';"
+				//re := regexp.MustCompile(`[\d]+`)
+				//size := re.FindStringSubmatch(fieldType)[0]
+				re := regexp.MustCompile(`[\w]+`)
+				columeType := re.FindStringSubmatch(fieldType)[0]
+				fmt.Println(columeType)
+				goType = "string"
+				if columeType == "text" {
+					fmt.Fprintln(ormFile,
+						fmt.Sprintf("%s %s `gorm:\"column:%s;NOT NULL;type:%s;comment:'%s';%s\"`",
+							strings.Title(fieldName), goType, fieldName, strings.ToUpper(fieldType),
+							fieldComment, index))
+				} else {
+					fmt.Fprintln(ormFile,
+						fmt.Sprintf("%s %s `gorm:\"column:%s;NOT NULL;type:%s;%scomment:'%s';%s\"`",
+							strings.Title(fieldName), goType, fieldName, strings.ToUpper(fieldType), defaultVal,
+							fieldComment, index))
+				}
+			default:
+				fmt.Fprintln(ormFile,
+					fmt.Sprintf("%s %s `gorm:\"column:%s;NOT NULL;%scomment:'%s';%s\"`",
+						strings.Title(fieldName), goType, fieldName, defaultVal,
+						fieldComment, index))
+			}
+		default:
+
+		}
+
+	}
+
+	if ormFile != nil {
+		fmt.Fprintln(ormFile, "}")
+
+		fmt.Fprintf(ormFile, "func ("+strings.Title(tableName)+") TableName() string {")
+		fmt.Fprintln(ormFile, "return \""+Camel2Case(tableName)+"\"")
+		fmt.Fprintln(ormFile, "}")
+
+		//func (info *Member) String() string {
+		//	return toString(info)
+		//}
+		fmt.Fprintf(ormFile, "func (info *"+strings.Title(tableName)+") String() string {")
+		fmt.Fprintln(ormFile, "return toString(info)")
+		fmt.Fprintln(ormFile, "}")
+		ormFile.Close()
+	}
+
+}
+
+func ToCamelCase(name string) string {
+	buffer := strings.Builder{}
+	buffer.Grow(len(name) + 20)
+	isUpper := true
+	for _, r := range name {
+		if isUpper {
+			buffer.WriteRune(unicode.ToUpper(r))
+			isUpper = false
+			continue
+		}
+		if byte(r) == '_' {
+			isUpper = true
+		} else {
+			buffer.WriteRune(r)
+		}
+	}
+	return buffer.String()
 }
 
 func Camel2Case(name string) string {
